@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GuessGame 0-9</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:inherit}
+body{background:#0f1117;color:#e6e6e6;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:640px;margin:0 auto;padding:16px}
+h1{margin:8px 0 4px}
+.sub{color:#9aa0b4;margin:0 0 16px;font-size:14px}
+button{border:1px solid #2c3040;background:#1a1d27;color:#e6e6e6;border-radius:8px;padding:10px 16px;font-size:16px;cursor:pointer}
+button.primary{background:#4f6ef7;border-color:#4f6ef7;color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+.box{background:#1a1d27;border-radius:10px;padding:14px;margin:12px 0}
+#nums{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:12px 0}
+#nums button{padding:14px 0;font-size:20px}
+#nums button.sel{background:#4f6ef7;border-color:#4f6ef7;font-weight:700;color:#fff}
+#nums button small{display:block;font-size:11px;font-weight:400;color:#9aa0b4;margin-top:2px}
+#nums button.sel small{color:#dfe5ff}
+#err{color:#ff6b6b;min-height:20px;margin-top:8px;font-size:14px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.tag{display:inline-block;border-radius:4px;padding:2px 8px;font-size:13px;margin-right:6px;color:#fff}
+#hist{list-style:none;padding:0;margin:16px 0}
+#hist li{background:#1a1d27;border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:14px}
+#hist a{color:#7d93ff}
+#betBox,#ownerBox,#claimBox{display:none}
+#ownerBox button{margin:0 8px 8px 0}
+.cl{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid #2c3040;font-size:14px}
+.cl button{padding:6px 12px;font-size:14px}
+#claimRound{width:80px;background:#0f1117;color:#e6e6e6;border:1px solid #2c3040;border-radius:8px;padding:8px;font-size:16px}
+</style>
+</head>
+<body>
+<h1>GuessGame 0-9</h1>
+<p class="sub">100 players, 1 coin per number, winners split the pool minus 5% rake</p>
+
+<div id="status" class="box">Not connected</div>
+
+<div id="walletBox" class="box">
+  <button class="primary" onclick="connect()">Connect Wallet</button>
+</div>
+
+<div id="betBox" class="box">
+  <div class="row"><span id="stake">Picked 0 numbers</span><span id="total">Total 0 coin</span></div>
+  <div id="nums"></div>
+  <div class="sub">Each cell: bets so far, and estimated payout per coin if it wins (5% rake)</div>
+  <button id="betBtn" class="primary" onclick="submitBet()" disabled>Place Bet</button>
+  <div id="err"></div>
+</div>
+
+<div id="ownerBox" class="box">
+  <button class="primary" onclick="doStartReveal()">Start Reveal</button>
+  <button onclick="doCancel()">Cancel Round</button>
+  <button onclick="doStartRound()">Start Next Round</button>
+  <button onclick="doWithdrawRake()">Withdraw Rake</button>
+</div>
+
+<div id="claimBox" class="box">
+  <div class="row"><span>Claim winnings or refund, round</span><input id="claimRound" type="number" min="1"></div>
+  <button class="primary" style="margin-top:10px" onclick="doClaim()">Claim</button>
+  <div id="claimMsg" class="sub"></div>
+  <div id="claimList"></div>
+</div>
+
+<ul id="hist"></ul>
+
+<script type="module">
+import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.4/+esm";
+
+const CONTRACT = "0x6e7C73bdFA7CFEB3140e4a5DEF1A0633b94aD68e";
+const COIN = 1; // 如果代币六位小数，改成 parseUnits
+const ABI = [
+  "function placeBet(uint8[] nums) payable",
+  "function startReveal()",
+  "function cancel()",
+  "function phase() view returns (uint8)",
+  "function draw() view returns (uint8)",
+  "function pool() view returns (uint256)",
+  "function counts(uint8) view returns (uint256)",
+  "function totalBets() view returns (uint256)",
+  "function round() view returns (uint256)",
+  "function claim(uint256 r)",
+  "function startRound()",
+  "function withdrawRake(uint256 r)",
+  "function rounds(uint256) view returns (uint8 phase, uint8 draw, bool refund, uint32 playerCount, uint32 totalBets, uint64 deadline, uint64 revealAt, uint256 requestId, uint256 share, uint256 rake, bool rakeTaken)",
+  "function mask(uint256, address) view returns (uint16)",
+  "function claimed(uint256, address) view returns (bool)",
+  "function owner() view returns (address)",
+  "event BetPlaced(address indexed player, uint8 num)",
+  "event Settled(uint8 draw, uint256 pool)",
+  "event VRFRequested(uint256 requestId)"
+];
+const PHASES = ["Idle", "Betting", "Revealing", "Settled"];
+const TAG_COLORS = ["#6b7280", "#4f6ef7", "#d99a1c", "#2fa36b"];
+const ROUND_MS = 5 * 60 * 1000;
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let provider, signer, address, contract, isOwner = false;
+let myPicks = new Set();
+let timer = null;
+
+window.connect = async function () {
+  try {
+    if (!window.ethereum) { $("status").textContent = "No wallet found. Please install MetaMask."; return; }
+    provider = new ethers.BrowserProvider(window.ethereum);
+    signer = await provider.getSigner();
+    address = await signer.getAddress();
+    contract = new ethers.Contract(CONTRACT, ABI, signer);
+    let owner = "";
+    try { owner = await contract.owner(); } catch (e) {}
+    isOwner = owner.toLowerCase() === address.toLowerCase();
+    $("walletBox").textContent = address.slice(0, 6) + "..." + address.slice(-4) + (isOwner ? " (owner)" : "");
+    $("betBox").style.display = "block";
+    $("claimBox").style.display = "block";
+    if (isOwner) $("ownerBox").style.display = "block";
+    await refresh();
+    listen();
+  } catch (e) {
+    $("status").textContent = "Connect failed: " + (e.shortMessage || e.message);
+  }
+};
+
+function showErr(m) { $("err").textContent = m; }
+function clearErr() { $("err").textContent = ""; }
+
+function updateStake() {
+  const n = myPicks.size;
+  $("stake").textContent = "Picked " + n + " number" + (n === 1 ? "" : "s");
+  $("total").textContent = "Total " + (n * COIN) + " coin";
+  $("betBtn").disabled = n === 0;
+  document.querySelectorAll("#nums button").forEach(b => {
+    b.classList.toggle("sel", myPicks.has(Number(b.dataset.n)));
+  });
+}
+
+for (let i = 0; i <= 9; i++) {
+  const b = document.createElement("button");
+  b.innerHTML = '<div>' + i + '</div><small id="od' + i + '"></small>';
+  b.dataset.n = i;
+  b.onclick = () => {
+    if (myPicks.has(i)) myPicks.delete(i); else myPicks.add(i);
+    clearErr();
+    updateStake();
+  };
+  $("nums").appendChild(b);
+}
+
+const RAKE = 0.05;
+let counts = Array(10).fill(0), totalBets = 0;
+
+function renderOdds() {
+  for (let i = 0; i <= 9; i++) {
+    const el = $("od" + i);
+    if (!el) continue;
+    const winners = counts[i] + 1; // include my own bet
+    const loserPool = totalBets - counts[i];
+    const payout = 1 + (loserPool * (1 - RAKE)) / winners;
+    el.textContent = counts[i] + " bets x" + payout.toFixed(2);
+  }
+}
+
+async function loadCounts() {
+  const [c, t] = await Promise.all([
+    Promise.all([...Array(10).keys()].map(i => contract.counts(i))),
+    contract.totalBets()
+  ]);
+  counts = c.map(Number);
+  totalBets = Number(t);
+  renderOdds();
+}
+
+async function refresh() {
+  loadCounts().catch(() => {});
+  const [ph, dr, pl, rd] = await Promise.all([contract.phase(), contract.draw(), contract.pool(), contract.round()]);
+  if (document.activeElement !== $("claimRound")) $("claimRound").value = rd;
+  if (lastRound !== null && lastRound !== Number(rd)) {
+    myPicks.clear();
+    $("betBtn").textContent = "Place Bet";
+    updateStake();
+  }
+  lastRound = Number(rd);
+  loadClaims(Number(rd)).catch(() => {});
+  const p = Number(ph);
+  let html = '<span class="tag" style="background:' + TAG_COLORS[p] + '">' + PHASES[p] + "</span>";
+  if (p === 3) html += "Draw: <b>" + dr + "</b> | Pool: " + ethers.formatEther(pl) + " coin";
+  else html += "Pool: " + ethers.formatEther(pl) + " coin";
+  if (p === 1) html += ' <span id="cd"></span>';
+  $("status").innerHTML = html;
+  if (p === 1) startCountdown(); else clearCountdown();
+}
+
+function startCountdown() {
+  clearCountdown();
+  const end = Date.now() + ROUND_MS;
+  const tick = () => {
+    const left = Math.max(0, end - Date.now());
+    const s = Math.floor(left / 1000);
+    const el = $("cd");
+    if (el) el.textContent = String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+  };
+  tick();
+  timer = setInterval(tick, 500);
+}
+function clearCountdown() { if (timer) { clearInterval(timer); timer = null; } }
+
+function addHist(draw, pool, hash, top) {
+  const li = document.createElement("li");
+  li.innerHTML = "Draw <b>" + draw + "</b> | Pool " + ethers.formatEther(pool) + " coin " +
+    '<a href="https://etherscan.io/tx/' + hash + '" target="_blank" rel="noopener">tx</a>';
+  if (top) $("hist").prepend(li); else $("hist").appendChild(li);
+  while ($("hist").children.length > 20) $("hist").lastChild.remove();
+}
+
+function listen() {
+  contract.on("BetPlaced", (player, num) => {
+    loadCounts().catch(() => {});
+    if (player.toLowerCase() === address.toLowerCase()) {
+      myPicks.add(Number(num));
+      updateStake();
+    }
+  });
+  contract.on("Settled", async (draw, pool, ev) => {
+    await refresh();
+    addHist(draw, pool, ev.log.transactionHash, true);
+  });
+  (async () => {
+    try {
+      const latest = await provider.getBlockNumber();
+      const logs = await contract.queryFilter(contract.filters.Settled(), latest - 5000, "latest");
+      logs.reverse().forEach(l => addHist(l.args[0], l.args[1], l.transactionHash, false));
+    } catch (e) {}
+  })();
+}
+
+window.submitBet = async function () {
+  if (myPicks.size === 0) { showErr("Pick at least one number"); return; }
+  const btn = $("betBtn");
+  btn.disabled = true;
+  btn.textContent = "Submitting...";
+  clearErr();
+  try {
+    if (Number(await contract.phase()) !== 1) throw new Error("Betting is not open");
+    await sleep(800);
+    if (Number(await contract.phase()) !== 1) throw new Error("Betting is not open");
+    const picks = [...myPicks];
+    const tx = await contract.placeBet(picks, { value: ethers.parseEther(String(COIN * picks.length)) });
+    await tx.wait();
+    btn.textContent = "Placed";
+    await refresh();
+  } catch (e) {
+    showErr(e.shortMessage || e.message);
+    btn.textContent = "Place Bet";
+    btn.disabled = myPicks.size === 0;
+  }
+};
+
+window.doStartReveal = async function () {
+  try {
+    clearErr();
+    if (Number(await contract.phase()) !== 1) throw new Error("Not in betting phase");
+    await sleep(1500);
+    if (Number(await contract.phase()) !== 1) throw new Error("Not in betting phase");
+    const tx = await contract.startReveal();
+    await tx.wait();
+    await refresh();
+  } catch (e) { showErr(e.shortMessage || e.message); }
+};
+
+let lastRound = null;
+
+async function loadClaims(cur) {
+  const rs = [];
+  for (let r = cur; r >= Math.max(1, cur - 9); r--) rs.push(r);
+  const data = await Promise.all(rs.map(async r => {
+    const [R, m, c] = await Promise.all([contract.rounds(r), contract.mask(r, address), contract.claimed(r, address)]);
+    return { r, R, m: Number(m), c };
+  }));
+  const coin = ethers.parseEther(String(COIN));
+  let html = "";
+  for (const { r, R, m, c } of data) {
+    if (m === 0) continue;
+    let label, btn = "";
+    if (Number(R.phase) !== 3) label = "in progress";
+    else if (c) label = "claimed";
+    else {
+      let amt = 0n;
+      if (R.refund) {
+        let n = 0;
+        for (let x = m; x; x &= x - 1) n++;
+        amt = BigInt(n) * coin;
+      } else if ((m >> Number(R.draw)) & 1) amt = coin + R.share;
+      if (amt > 0n) {
+        label = ethers.formatEther(amt) + " coin" + (R.refund ? " (refund)" : "");
+        btn = '<button class="primary" onclick="claimFor(' + r + ')">Claim</button>';
+      } else label = "no win";
+    }
+    html += '<div class="cl"><span>Round ' + r + ": " + label + "</span>" + btn + "</div>";
+  }
+  $("claimList").innerHTML = html || '<div class="sub">No recent rounds joined</div>';
+}
+
+window.claimFor = async function (r) {
+  $("claimRound").value = r;
+  await window.doClaim();
+};
+
+function claimMsg(text, bad) {
+  const el = $("claimMsg");
+  el.textContent = text;
+  el.style.color = bad ? "#ff6b6b" : "#9aa0b4";
+}
+
+window.doClaim = async function () {
+  try {
+    claimMsg("Claiming...", false);
+    const tx = await contract.claim(BigInt($("claimRound").value));
+    await tx.wait();
+    claimMsg("Claimed", false);
+    loadClaims(lastRound).catch(() => {});
+  } catch (e) { claimMsg(e.shortMessage || e.message, true); }
+};
+
+window.doStartRound = async function () {
+  try {
+    clearErr();
+    const tx = await contract.startRound();
+    await tx.wait();
+    await refresh();
+  } catch (e) { showErr(e.shortMessage || e.message); }
+};
+
+window.doWithdrawRake = async function () {
+  try {
+    clearErr();
+    const tx = await contract.withdrawRake(BigInt($("claimRound").value));
+    await tx.wait();
+  } catch (e) { showErr(e.shortMessage || e.message); }
+};
+
+window.doCancel = async function () {
+  try {
+    clearErr();
+    if (!confirm("Cancel this round?")) return;
+    const tx = await contract.cancel();
+    await tx.wait();
+    await refresh();
+  } catch (e) { showErr(e.shortMessage || e.message); }
+};
+</script>
+</body>
+</html>
